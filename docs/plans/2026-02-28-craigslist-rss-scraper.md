@@ -1,35 +1,26 @@
-package jobs
+# Craigslist RSS Scraper Implementation Plan
 
-import (
-	"context"
-	"encoding/xml"
-	"fmt"
-	"log/slog"
-	"net/http"
-	"net/url"
-	"regexp"
-	"strings"
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-	"github.com/anatolykoptev/go_job/internal/engine"
-)
+**Goal:** Replace SearXNG-based Craigslist search with direct RSS feed scraping via BrowserClient for higher quality and quantity of job listings.
 
-const craigslistSiteSearch = "site:craigslist.org"
+**Architecture:** Fetch Craigslist's built-in RSS feed (`?format=rss` on search URLs) using BrowserClient (Chrome TLS fingerprint) to bypass bot detection. Parse the RSS XML into `[]engine.SearxngResult`. Map user location strings to Craigslist region subdomains. Keep SearXNG as fallback when BrowserClient is unavailable.
 
-// craigslistListingRe matches individual Craigslist job posting URLs
-// (e.g. sfbay.craigslist.org/pen/sof/d/san-mateo-senior-engineer/7856959859.html).
-var craigslistListingRe = regexp.MustCompile(`craigslist\.org/.+/\d+\.html`)
+**Tech Stack:** `encoding/xml` for RSS parsing, `engine.BrowserClient` for HTTP, existing `engine.SearxngResult` type.
 
-// craigslistJobCategories are the Craigslist sections that contain job postings.
-var craigslistJobCategories = []string{
-	"/sof/", "/web/", "/cps/", "/tch/", "/eng/", "/sci/",
-	"/jjj/", "/bus/", "/ofc/", "/mnu/", "/sls/", "/trp/",
-	"/med/", "/hea/", "/edu/", "/acc/", "/fbh/", "/lab/",
-	"/sec/", "/ret/", "/mar/", "/hum/", "/lgl/", "/npo/",
-	"/rej/", "/spa/", "/gov/", "/art/", "/wri/",
-}
+---
 
-// --- RSS types ---
+### Task 1: Add Craigslist RSS types and region mapping
 
+**Files:**
+- Modify: `internal/engine/jobs/craigslist.go`
+
+**Step 1: Add RSS XML types and region map**
+
+Add after the existing imports and constants:
+
+```go
+// craigslistRSS represents the RSS feed from Craigslist search.
 type craigslistRSS struct {
 	XMLName xml.Name             `xml:"rss"`
 	Channel craigslistRSSChannel `xml:"channel"`
@@ -43,15 +34,14 @@ type craigslistRSSItem struct {
 	Title       string `xml:"title"`
 	Link        string `xml:"link"`
 	Description string `xml:"description"`
-	Date        string `xml:"date"` // dc:date — ISO 8601
+	Date        string `xml:"dc:date"` // ISO 8601: 2026-02-28T12:00:00-08:00
 }
 
-// --- Region mapping ---
-
 // craigslistRegions maps common location keywords to Craigslist subdomains.
+// Falls back to "www" (redirects to nearest region).
 var craigslistRegions = map[string]string{
-	"san francisco": "sfbay", "sf": "sfbay", "bay area": "sfbay",
-	"oakland": "sfbay", "san jose": "sfbay", "silicon valley": "sfbay",
+	"san francisco": "sfbay", "sf": "sfbay", "bay area": "sfbay", "oakland": "sfbay",
+	"san jose": "sfbay", "silicon valley": "sfbay",
 	"new york": "newyork", "nyc": "newyork", "manhattan": "newyork", "brooklyn": "newyork",
 	"los angeles": "losangeles", "la": "losangeles",
 	"chicago": "chicago",
@@ -73,11 +63,13 @@ var craigslistRegions = map[string]string{
 	"las vegas": "lasvegas", "vegas": "lasvegas",
 }
 
+// resolveRegion maps a user-provided location string to a Craigslist subdomain.
 func resolveRegion(location string) string {
 	loc := strings.ToLower(strings.TrimSpace(location))
 	if region, ok := craigslistRegions[loc]; ok {
 		return region
 	}
+	// Try partial match: "San Francisco, CA" → "san francisco"
 	for key, region := range craigslistRegions {
 		if strings.Contains(loc, key) {
 			return region
@@ -85,9 +77,34 @@ func resolveRegion(location string) string {
 	}
 	return "www"
 }
+```
 
-// --- RSS fetch ---
+Add `"encoding/xml"` to the imports.
 
+**Step 2: Build and verify**
+
+Run: `cd ~/src/go-job && go build -buildvcs=false ./...`
+Expected: clean build
+
+**Step 3: Commit**
+
+```bash
+git add internal/engine/jobs/craigslist.go
+git commit -m "feat(craigslist): add RSS types and region mapping"
+```
+
+---
+
+### Task 2: Implement RSS feed fetcher
+
+**Files:**
+- Modify: `internal/engine/jobs/craigslist.go`
+
+**Step 1: Add the RSS fetch + parse function**
+
+Add a new function below `resolveRegion`:
+
+```go
 // fetchCraigslistRSS fetches and parses the Craigslist RSS feed for a given query/location.
 // Requires BrowserClient (Craigslist blocks non-browser TLS fingerprints).
 func fetchCraigslistRSS(ctx context.Context, query, location string, limit int) ([]engine.SearxngResult, error) {
@@ -118,6 +135,7 @@ func fetchCraigslistRSS(ctx context.Context, query, location string, limit int) 
 	return parseCraigslistRSS(data, limit)
 }
 
+// parseCraigslistRSS parses Craigslist RSS XML into SearxngResult slice.
 func parseCraigslistRSS(body []byte, limit int) ([]engine.SearxngResult, error) {
 	var rss craigslistRSS
 	if err := xml.Unmarshal(body, &rss); err != nil {
@@ -132,7 +150,7 @@ func parseCraigslistRSS(body []byte, limit int) ([]engine.SearxngResult, error) 
 
 		posted := ""
 		if len(item.Date) >= 10 {
-			posted = item.Date[:10]
+			posted = item.Date[:10] // YYYY-MM-DD
 		}
 
 		content := "**Source:** Craigslist"
@@ -140,7 +158,8 @@ func parseCraigslistRSS(body []byte, limit int) ([]engine.SearxngResult, error) 
 			content += " | **Posted:** " + posted
 		}
 		if item.Description != "" {
-			content += "\n\n" + engine.TruncateAtWord(item.Description, 300)
+			desc := engine.TruncateAtWord(item.Description, 300)
+			content += "\n\n" + desc
 		}
 
 		results = append(results, engine.SearxngResult{
@@ -157,15 +176,38 @@ func parseCraigslistRSS(body []byte, limit int) ([]engine.SearxngResult, error) 
 
 	return results, nil
 }
+```
 
-// --- Main search function ---
+Add `"fmt"`, `"net/http"`, `"net/url"` to imports.
 
-// SearchCraigslistJobs searches Craigslist job listings.
-// Primary: RSS feed via BrowserClient (structured data, more results).
-// Fallback: SearXNG site: search when BrowserClient is unavailable or RSS fails.
+**Step 2: Build and verify**
+
+Run: `cd ~/src/go-job && go build -buildvcs=false ./...`
+Expected: clean build
+
+**Step 3: Commit**
+
+```bash
+git add internal/engine/jobs/craigslist.go
+git commit -m "feat(craigslist): implement RSS feed fetcher via BrowserClient"
+```
+
+---
+
+### Task 3: Wire RSS into SearchCraigslistJobs with SearXNG fallback
+
+**Files:**
+- Modify: `internal/engine/jobs/craigslist.go`
+
+**Step 1: Rewrite SearchCraigslistJobs to try RSS first, fallback to SearXNG**
+
+Replace the existing `SearchCraigslistJobs` function body:
+
+```go
 func SearchCraigslistJobs(ctx context.Context, query, location string, limit int) ([]engine.SearxngResult, error) {
 	engine.IncrCraigslistRequests()
 
+	// Primary: RSS feed via BrowserClient (structured data, more results).
 	if engine.Cfg.BrowserClient != nil {
 		results, err := fetchCraigslistRSS(ctx, query, location, limit)
 		if err != nil {
@@ -210,12 +252,72 @@ func SearchCraigslistJobs(ctx context.Context, query, location string, limit int
 		slog.Int("listings", len(results)))
 	return results, nil
 }
+```
 
-func isCraigslistJobCategory(u string) bool {
-	for _, cat := range craigslistJobCategories {
-		if strings.Contains(u, cat) {
-			return true
-		}
-	}
-	return false
-}
+**Step 2: Build and vet**
+
+Run: `cd ~/src/go-job && go build -buildvcs=false ./... && go vet ./...`
+Expected: clean
+
+**Step 3: Commit**
+
+```bash
+git add internal/engine/jobs/craigslist.go
+git commit -m "feat(craigslist): use RSS as primary source, SearXNG as fallback"
+```
+
+---
+
+### Task 4: Deploy and smoke test
+
+**Files:** none (deployment only)
+
+**Step 1: Fix file ownership**
+
+```bash
+sudo chown krolik:krolik ~/src/go-job/internal/engine/jobs/craigslist.go
+```
+
+**Step 2: Build and deploy**
+
+```bash
+cd ~/deploy/krolik-server
+docker compose build --no-cache go-job
+docker compose up -d --no-deps --force-recreate go-job
+sleep 3
+curl -s http://127.0.0.1:8891/health
+```
+
+Expected: `{"status":"ok",...}`
+
+**Step 3: Smoke test — RSS path**
+
+```bash
+curl -s -X POST http://127.0.0.1:8891/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"job_search","arguments":{"query":"software engineer","location":"San Francisco","platform":"craigslist","limit":5}}
+}'
+```
+
+Expected: jobs with `craigslist.org` URLs, more results than before.
+
+**Step 4: Smoke test — different regions**
+
+Test with: `"driver" + "Los Angeles"`, `"nurse" + "Seattle"`, `"sales" + "New York"`
+
+**Step 5: Verify metrics**
+
+```bash
+curl -s http://127.0.0.1:8891/metrics | grep craigslist
+```
+
+Expected: `craigslist_requests` incremented.
+
+**Step 6: Commit and push**
+
+```bash
+cd ~/src/go-job
+git add -A
+git commit -m "deploy: verify craigslist RSS scraper"
+git push origin master
+```
